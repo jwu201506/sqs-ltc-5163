@@ -1,0 +1,64 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'AWS CloudFormation template: creates a SQS.'
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues:
+      [ "dev", "int", "uat", "load", "cert", "prod" ]
+    Description: The deployment environment
+  CloudwatchPeriod:
+    Type: Number
+    Description: Duration that cloud watch should check
+    Default: 300
+  CloudwatchEvaluationPeriods:
+    Type: Number
+    Description: Data point
+    Default: 1
+  CloudwatchThreshold:
+    Type: Number
+    Description: CloudWatch Threshold
+    Default: 1
+
+Conditions:
+  SubscribeToPagerDutyCondition: !Or [ !Equals [!Ref EnvironmentName, "prod"], !Equals [!Ref EnvironmentName, "dev"] , !Equals [!Ref EnvironmentName, "load"]]
+  isProdSns : !Or [ !Equals [!Ref EnvironmentName, "prod"], !Equals [!Ref EnvironmentName, "cert"] ]
+
+Resources:
+  MyQueue:
+    Properties:
+      QueueName: !Sub '${EnvironmentName}-collector-data-sync'
+    Type: 'AWS::SQS::Queue'
+
+  SQSMessageReceivedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm if Collector Data Sync received Any message which means error in downstream"
+      AlarmName: !Sub "${EnvironmentName}-collector-data-sync-message-received-alarm"
+      AlarmActions:
+        - !If [SubscribeToPagerDutyCondition,
+               !If [isProdSns, !ImportValue 'prod-auth0-delta-cloudwatch-sns', !ImportValue 'nonprod-auth0-delta-cloudwatch-sns'],
+               !Ref "AWS::NoValue"]
+      MetricName: "NumberOfMessagesReceived"
+      Namespace: !Sub "AWS/SQS"
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt MyQueue.QueueName
+      Statistic: "Sum"
+      TreatMissingData: notBreaching
+      Period: !Ref CloudwatchPeriod
+      EvaluationPeriods: !Ref CloudwatchEvaluationPeriods
+      Threshold: !Ref CloudwatchThreshold
+      ComparisonOperator: "GreaterThanOrEqualToThreshold"
+Outputs:
+  QueueURL:
+    Description: The URL of the queue
+    Value: !Ref MyQueue
+    Export:
+      Name: !Sub '${EnvironmentName}-collector-data-sync-QueueURL'
+  QueueARN:
+    Description: The ARN of the queue
+    Value: !GetAtt
+      - MyQueue
+      - Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-collector-data-sync-QueueARN'
