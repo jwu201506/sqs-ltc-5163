@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: "Notification Service Producer"
+Globals:
+  Api:
+    OpenApiVersion: '3.0.1'
+  Function:
+    Runtime: nodejs10.x
+    Timeout: 30
+Parameters:
+  EnvironmentName:
+    Type: String
+    AllowedValues:
+      - dev
+      - int
+      - load
+      - uat
+      - cert
+      - prod
+    Default: dev
+    Description: The deployment environment
+  EmailTtlMinutes:
+    Type: Number
+    Description: The time-to-live value for email requests in minutes
+    Default: 720
+  LambdaMemorySize:
+    Type: Number
+    Description: Memory to be allocated for the Lambda, in MB
+    Default: 512
+  ProvisionedConcurrency:
+    Type: Number
+    Default: 0
+    MinValue: 0
+  LogRetention:
+    Type: Number
+    Description: The number of days the log streams are to be persisted in CW
+    Default: 14
+  LambdaErrorRateAlarmThreshold:
+    Type: Number
+    Description: Lambda error rate percentage threshold for which alarm is to be triggered
+    Default: 0.5
+  LambdaThrottledAlarmThreshold:
+    Type: Number
+    Description: Maximum number of lambda invocations throttled in 5 mins, before alarm is triggered
+    Default: 5
+Conditions:
+  isProdAccount: !Equals [ !Ref 'EnvironmentName', 'prod']
+  isCertAccount: !Equals [ !Ref 'EnvironmentName', 'cert']
+  isLoadAccount: !Equals [ !Ref 'EnvironmentName', 'load']
+  HasProvisionedConcurrency: !Not [ !Equals [ !Ref ProvisionedConcurrency, 0 ] ]
+Resources:
+  ProducerLambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+        AlarmName: !Sub '${NotificationApiLambdaOnVPC}-high-number-throttled-invocation'
+        AlarmDescription: !Sub 'Triggers when number of throttled lambda invocation is higher than ${LambdaThrottledAlarmThreshold}'
+        AlarmActions: 
+        - {'Fn::ImportValue': !Sub '${EnvironmentName}-yyz-pagerduty'}
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        EvaluationPeriods: 1
+        MetricName: Throttles
+        Namespace: AWS/Lambda
+        Statistic: Sum
+        Threshold: !Ref LambdaThrottledAlarmThreshold
+        DatapointsToAlarm: 1
+        Dimensions:
+            - Name: FunctionName
+              Value: !Ref NotificationApiLambdaOnVPC
+        Period: 300
+  ProducerLambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${NotificationApiLambdaOnVPC}-high-error-rate'
+      AlarmDescription: !Sub 'Triggers when lambda error rate is above ${LambdaErrorRateAlarmThreshold}'
+      AlarmActions:
+      - {'Fn::ImportValue': !Sub '${EnvironmentName}-yyz-pagerduty'}
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 1
+      Threshold: !Ref LambdaErrorRateAlarmThreshold
+      DatapointsToAlarm: 1
+      Metrics:
+        - Id: e1
+          Expression: 'm1 / m2 * 100'
+          Label: !Sub '${NotificationApiLambdaOnVPC}-ErrorPercentage'
+        - Id: m1
+          MetricStat:
+              Metric:
+                Namespace: AWS/Lambda
+                MetricName: Errors
+                Dimensions:
+                  - Name: FunctionName
+                    Value: !Ref NotificationApiLambdaOnVPC
+              Period: 300
+              Stat: Sum
+          ReturnData: false
+        - Id: m2
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref NotificationApiLambdaOnVPC
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub Notification Service SG for ${AWS::StackName}
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: collector-interface-${EnvironmentName}-VpcId
+  ProducerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-notification-service-producer-role-onvpc'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        - 'arn:aws:iam::aws:policy/CloudWatchLambdaInsightsExecutionRolePolicy'
+        - !Ref ProducerPolicy
+  ProducerPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      ManagedPolicyName: !Sub '${EnvironmentName}-notification-service-producer-policy-onvpc'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'kms:GenerateDataKey'
+            Resource: 
+              - Fn::ImportValue: !If [ isProdAccount, 'collector-prod-application' , !If [ isCertAccount, 'collector-cert-application', 'collector-nonprod-application'] ]
+          - Effect: Allow
+            Action:
+              - 'kinesis:PutRecord'
+              - 'kinesis:PutRecords'
+            Resource: 
+              - Fn::ImportValue:
+                  !Sub '${EnvironmentName}-notification-service-kinesis-KinesisId'
+  ProducerLogSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn:
+      - ProducerLambdaLogGroup
+    Properties:
+      RoleArn:
+        Fn::ImportValue: !If [ isProdAccount, 'prod-kinesissplunk-Role-Arn' , !If [ isCertAccount, 'cert-kinesissplunk-Role-Arn', 'nonprod-kinesissplunk-Role-Arn'] ] 
+      LogGroupName: !Join ['/', ['/aws/lambda', !Ref NotificationApiLambdaOnVPC]]
+      FilterPattern: ""
+      DestinationArn:
+        Fn::ImportValue: !If [ isProdAccount, 'prod-kinesissplunk-Stream-Arn' , !If [ isCertAccount, 'cert-kinesissplunk-Stream-Arn', 'nonprod-kinesissplunk-Stream-Arn'] ] 
+  ProducerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+        LogGroupName: !Join ['/', ['/aws/lambda', !Ref NotificationApiLambdaOnVPC]]
+        RetentionInDays: !Ref LogRetention
+  NotificationApiLambdaOnVPC:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      FunctionName: !Sub ${EnvironmentName}-notification-service-producer
+      Handler: handler.postMessage
+      Layers: !If 
+        - isLoadAccount
+        - - !Sub arn:aws:lambda:${AWS::Region}:580247275435:layer:LambdaInsightsExtension:2
+        - !Ref AWS::NoValue
+      AutoPublishAlias: live
+      ProvisionedConcurrencyConfig:
+          !If
+          - HasProvisionedConcurrency
+          - ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrency
+          - !Ref "AWS::NoValue"
+      DeploymentPreference:
+        Type: AllAtOnce
+      Role: !GetAtt
+        - ProducerRole
+        - Arn
+      CodeUri: ./../../../lambda_dist
+      AutoPublishAlias: !Ref EnvironmentName
+      Description: "RESTful API endpoint Amazon API Gateway"
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue:
+              Fn::Sub: collector-interface-${EnvironmentName}-Private-A-SubID
+          - Fn::ImportValue:
+              Fn::Sub: collector-interface-${EnvironmentName}-Private-B-SubID
+          - Fn::ImportValue:
+              Fn::Sub: collector-interface-${EnvironmentName}-Private-C-SubID
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          NS_EMAIL_STREAM_NAME: 
+            Fn::ImportValue: !Sub '${EnvironmentName}-notification-service-kinesis-StreamName'
+          NS_STREAM_REGION: us-east-1
+          NS_EMAIL_TTL_MINUTES: !Ref EmailTtlMinutes
+      MemorySize: !Ref LambdaMemorySize
+Outputs:
+  RoleName:
+    Description: IAM Role name for producer
+    Value: !GetAtt 
+      - ProducerRole
+      - Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RoleId'
+  PolicyName:
+    Description: IAM Policy name for producer
+    Value: !Ref ProducerPolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-PolicyId'
+  NotificationApiLambdaOnVPC:
+    Description: NotificationApiLambdaOnVPC
+    Value:
+      Fn::GetAtt: NotificationApiLambdaOnVPC.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-NotificationApiLambdaOnVPC'
